@@ -111,6 +111,8 @@ class Scheduler(SchedulerInterface):
         # for these models.
         self.encoder_cache_manager = EncoderCacheManager(
             cache_size=encoder_cache_size)
+        
+        self.draft_mode = self.use_speculative_decoding = None
 
     def schedule(self) -> SchedulerOutput:
         # NOTE(woosuk) on the scheduling algorithm:
@@ -149,10 +151,17 @@ class Scheduler(SchedulerInterface):
         # For logging.
         scheduled_timestamp = time.monotonic()
 
+        # TODO: VERY HACKY PROPAGATION SOLUTION FOR CUSTOM SD FLAGS.
+        # PROBABLY NEEDS TO GO IN A CONFIG CLASS... BUT THIS WILL DO FOR NOW.
+        # JUST NEED TO GET IT TO THE GPU WORKER ASAP.
+
         # First, schedule the RUNNING requests.
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
+            if self.draft_mode is None:
+                self.draft_mode = request.sampling_params.draft_mode
+                self.use_speculative_decoding = request.sampling_params.use_speculative_decoding
             if request.request_id in self.scheduled_req_ids:
                 # This request has already been scheduled.
                 req_index += 1
@@ -269,6 +278,10 @@ class Scheduler(SchedulerInterface):
                     break
 
                 request = self.waiting[0]
+
+                if self.draft_mode is None:
+                    self.draft_mode = request.sampling_params.draft_mode
+                    self.use_speculative_decoding = request.sampling_params.use_speculative_decoding
 
                 # Skip request if the structured output request is still waiting
                 # for FSM compilation.
@@ -432,6 +445,8 @@ class Scheduler(SchedulerInterface):
             free_encoder_input_ids=self.encoder_cache_manager.get_freed_ids(),
             structured_output_request_ids=structured_output_request_ids,
             grammar_bitmask=grammar_bitmask,
+            use_speculative_decoding=self.use_speculative_decoding,
+            draft_mode=self.draft_mode
         )
 
         # Advance the number of computed tokens for the request AFTER
@@ -473,7 +488,8 @@ class Scheduler(SchedulerInterface):
             req_data = CachedRequestData.from_request(request,
                                                       resumed_from_preemption,
                                                       new_token_ids,
-                                                      new_block_ids)
+                                                      new_block_ids,
+                                                      request.sampling_params.draft_logits)
             self._cached_reqs_data[request.request_id] = req_data
         return req_data
 

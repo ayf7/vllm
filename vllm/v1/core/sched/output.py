@@ -59,6 +59,7 @@ class CachedRequestData:
     resumed_from_preemption: bool
     new_token_ids: list[int]
     new_block_ids: list[int]
+    draft_token_logits: list[float]
     num_computed_tokens: int
 
     @classmethod
@@ -68,12 +69,14 @@ class CachedRequestData:
         resumed_from_preemption: bool,
         new_token_ids: list[int],
         new_block_ids: list[int],
+        draft_token_logits: list[float]
     ) -> CachedRequestData:
         return cls(
             req_id=request.request_id,
             resumed_from_preemption=resumed_from_preemption,
             new_token_ids=new_token_ids,
             new_block_ids=new_block_ids,
+            draft_token_logits=draft_token_logits,
             num_computed_tokens=request.num_computed_tokens,
         )
 
@@ -121,3 +124,6 @@ class SchedulerOutput:
     structured_output_request_ids: dict[str, int]
     # the bitmask for the whole batch
     grammar_bitmask: Optional[npt.NDArray[np.int32]]
+
+    use_speculative_decoding: bool
+    draft_mode: bool

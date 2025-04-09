@@ -112,6 +112,9 @@ class OpenAIServingCompletion(OpenAIServing):
                 truncate_prompt_tokens=request.truncate_prompt_tokens,
                 add_special_tokens=request.add_special_tokens,
             )
+
+            # print("request_prompts >", request_prompts)
+            # print("engine_prompts >", engine_prompts)
         except ValueError as e:
             logger.exception("Error in preprocessing prompt inputs")
             return self.create_error_response(str(e))
@@ -152,6 +155,7 @@ class OpenAIServingCompletion(OpenAIServing):
                 trace_headers = (None if raw_request is None else await
                                  self._get_trace_headers(raw_request.headers))
 
+                print("CREATED SAMPLING PARAMS:", sampling_params)
                 if isinstance(sampling_params, BeamSearchParams):
                     generator = self.engine_client.beam_search(
                         prompt=engine_prompt,

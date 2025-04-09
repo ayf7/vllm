@@ -490,6 +490,7 @@ async def create_chat_completion(request: ChatCompletionRequest,
 @load_aware_call
 async def create_completion(request: CompletionRequest, raw_request: Request):
     handler = completion(raw_request)
+    print("--- COMPLETION REQUEST ---", request)
     if handler is None:
         return base(raw_request).create_error_response(
             message="The model does not support Completions API")

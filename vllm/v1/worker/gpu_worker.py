@@ -240,6 +240,7 @@ class Worker(WorkerBase):
         scheduler_output: "SchedulerOutput",
     ) -> Optional[ModelRunnerOutput]:
         output = self.model_runner.execute_model(scheduler_output)
+        print("\n\n -----> OUTPUT -- \n\n", output)
         return output if self.is_driver_worker else None
 
     def profile(self, is_start: bool = True):

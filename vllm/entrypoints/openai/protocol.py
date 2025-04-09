@@ -737,6 +737,13 @@ class CompletionRequest(OpenAIBaseModel):
     prompt_logprobs: Optional[int] = None
     # doc: end-completion-sampling-params
 
+    # doc: begin-speculative-decoding
+    use_speculative_decoding: Optional[bool] = False # draft, below vars ignored if False
+    draft_mode: Optional[bool] = False # if True, will use [max_tokens] to draft tokens
+    draft_tokens: Optional[list[int]] = None # denotes the number of tokesn in the last model that are drafts
+    draft_logits: Optional[list[float]] = None
+    # doc: end-speculative-decoding
+
     # doc: begin-completion-extra-params
     add_special_tokens: bool = Field(
         default=True,
@@ -934,7 +941,11 @@ class CompletionRequest(OpenAIBaseModel):
                 else RequestOutputKind.FINAL_ONLY,
             guided_decoding=guided_decoding,
             logit_bias=self.logit_bias,
-            allowed_token_ids=self.allowed_token_ids)
+            allowed_token_ids=self.allowed_token_ids,
+            use_speculative_decoding=self.use_speculative_decoding,
+            draft_mode=self.draft_mode,
+            draft_tokens=self.draft_tokens,
+            draft_logits=self.draft_logits)
 
     @model_validator(mode="before")
     @classmethod

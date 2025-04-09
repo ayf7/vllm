@@ -31,6 +31,10 @@ class Request:
         arrival_time: float,
         lora_request: Optional["LoRARequest"] = None,
         structured_output_request: Optional["StructuredOutputRequest"] = None,
+        use_speculative_decoding: bool = False,
+        draft_mode: bool = False,
+        draft_tokens: Optional[list[int]] = None,
+        draft_logits: Optional[list[float]] = None
     ) -> None:
         self.request_id = request_id
         self.sampling_params = sampling_params
@@ -88,6 +92,7 @@ class Request:
             lora_request=request.lora_request,
             structured_output_request=StructuredOutputRequest(
                 sampling_params=request.sampling_params),
+            
         )
 
     def append_output_token_ids(

@@ -200,6 +200,7 @@ class AsyncLLM(EngineClient):
                                                 prompt_adapter_request,
                                                 priority)
 
+        print("\n\n--- ENGINE CORE REQUEST ---\n\n", request)
         if params.n == 1:
             await self._add_request(request, None, 0, queue)
             return queue

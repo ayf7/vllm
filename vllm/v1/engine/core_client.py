@@ -270,6 +270,8 @@ class CoreEngine:
     ):
         self.index = index
         self.identity = index.to_bytes(length=2, byteorder="little")
+
+        print("executor class >>", executor_class)
         try:
             # Start EngineCore in background process.
             self.proc_handle = BackgroundProcHandle(

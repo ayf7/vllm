@@ -177,6 +177,8 @@ class EngineCore:
                 request.mm_inputs, request.mm_hashes)
 
         req = Request.from_engine_core_request(request)
+
+        print("\n\n --- REQUEST --- \n\n", req)
         if req.use_structured_output:
             # Start grammar compilation asynchronously
             self.structured_output_manager.grammar_init(req)
@@ -203,6 +205,7 @@ class EngineCore:
                 scheduler_stats=self.scheduler.make_stats(),
             )
         scheduler_output = self.scheduler.schedule()
+        print("\n\n--- SCHEDULER OUTPUT ---\n\n", scheduler_output)
         output = self.model_executor.execute_model(scheduler_output)
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, output)  # type: ignore

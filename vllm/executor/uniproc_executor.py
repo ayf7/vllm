@@ -53,7 +53,10 @@ class UniProcExecutor(ExecutorBase):
                        kwargs: Optional[Dict] = None) -> List[Any]:
         if kwargs is None:
             kwargs = {}
+        # print("run_method:", method, args, kwargs)
+        # print("worker:", self.driver_worker.worker)
         answer = run_method(self.driver_worker, method, args, kwargs)
+        # print("answer:", type(answer))
         return [answer]
 
     def check_health(self) -> None:
