@@ -4,6 +4,14 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 
+@dataclass
+class PipelinedSpecDecodeMetadata:
+    draft_mode: bool # small model = True, big model = False
+    # [num_tokens]
+    draft_token_ids: list[int]
+    # [num_tokens]
+    draft_token_logits: list[int]
+    
 
 @dataclass
 class SpecDecodeMetadata:

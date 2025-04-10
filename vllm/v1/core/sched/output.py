@@ -59,6 +59,7 @@ class CachedRequestData:
     resumed_from_preemption: bool
     new_token_ids: list[int]
     new_block_ids: list[int]
+    draft_token_ids: list[int]
     draft_token_logits: list[float]
     num_computed_tokens: int
 
@@ -69,6 +70,7 @@ class CachedRequestData:
         resumed_from_preemption: bool,
         new_token_ids: list[int],
         new_block_ids: list[int],
+        draft_token_ids: list[int],
         draft_token_logits: list[float]
     ) -> CachedRequestData:
         return cls(
@@ -77,6 +79,7 @@ class CachedRequestData:
             new_token_ids=new_token_ids,
             new_block_ids=new_block_ids,
             draft_token_logits=draft_token_logits,
+            draft_token_ids=draft_token_ids,
             num_computed_tokens=request.num_computed_tokens,
         )
 
@@ -127,3 +130,5 @@ class SchedulerOutput:
 
     use_speculative_decoding: bool
     draft_mode: bool
+    draft_tokens : dict[str, list[int]]
+    draft_logprobs: dict[str, list[float]]

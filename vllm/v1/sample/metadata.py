@@ -41,3 +41,4 @@ class SamplingMetadata:
 
     # req_index -> bad_words_token_ids
     bad_words_token_ids: dict[int, list[list[int]]]
+    draft_token_ids: Optional[torch.Tensor] = None

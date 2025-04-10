@@ -279,6 +279,8 @@ class Scheduler(SchedulerInterface):
 
                 request = self.waiting[0]
 
+                # NOTE: this is a pretty jank way of dynamically creating this.
+                # I think it should go into VLLM config, but this will suffice.
                 if self.draft_mode is None:
                     self.draft_mode = request.sampling_params.draft_mode
                     self.use_speculative_decoding = request.sampling_params.use_speculative_decoding
@@ -405,6 +407,16 @@ class Scheduler(SchedulerInterface):
             structured_output_request_ids,
             len(self.running),
         )
+
+        # Speculative decoding: constructing token logits and stuff
+        draft_tokens : dict[str, list[int]] = {}
+        draft_logprobs : dict[str, list[float]] = {}
+        # NOTE: FOCUSING ON JUST ONE PROMPT FOR NOW.
+        for req_id, req in self.requests.items():
+            if req.sampling_params.draft_tokens:
+                draft_tokens[req_id] = req.sampling_params.draft_tokens[0]
+                draft_logprobs[req_id] = req.sampling_params.draft_logits[0]
+
         # Construct the scheduler output.
         new_reqs_data = [
             NewRequestData.from_request(req,
@@ -446,7 +458,9 @@ class Scheduler(SchedulerInterface):
             structured_output_request_ids=structured_output_request_ids,
             grammar_bitmask=grammar_bitmask,
             use_speculative_decoding=self.use_speculative_decoding,
-            draft_mode=self.draft_mode
+            draft_mode=self.draft_mode,
+            draft_tokens=draft_tokens,
+            draft_logprobs=draft_logprobs
         )
 
         # Advance the number of computed tokens for the request AFTER
@@ -489,6 +503,7 @@ class Scheduler(SchedulerInterface):
                                                       resumed_from_preemption,
                                                       new_token_ids,
                                                       new_block_ids,
+                                                      request.sampling_params.draft_tokens,
                                                       request.sampling_params.draft_logits)
             self._cached_reqs_data[request.request_id] = req_data
         return req_data

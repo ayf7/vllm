@@ -68,6 +68,10 @@ class SamplerOutput:
     # PLACEHOLDER_TOKEN_ID (-1 by default) is used for padding.
     sampled_token_ids: torch.Tensor
     logprobs_tensors: Optional[LogprobsTensors]
+    
+    # basically logprobs of the original drafts
+    draft_logprobs_tensors: Optional[torch.Tensor]
+
 
 
 # ModelRunnerOutput is serialized and sent to the scheduler process.

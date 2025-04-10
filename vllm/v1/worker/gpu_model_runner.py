@@ -9,6 +9,7 @@ import numpy as np
 import torch
 import torch.distributed
 import torch.nn as nn
+import random
 
 from vllm.attention import AttentionType, get_attn_backend
 from vllm.attention.layer import Attention
@@ -36,7 +37,7 @@ from vllm.v1.outputs import (EMPTY_MODEL_RUNNER_OUTPUT, LogprobsTensors,
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.rejection_sampler import RejectionSampler
 from vllm.v1.spec_decode.eagle import EagleProposer
-from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
+from vllm.v1.spec_decode.metadata import SpecDecodeMetadata, PipelinedSpecDecodeMetadata
 from vllm.v1.spec_decode.ngram_proposer import NgramProposer
 from vllm.v1.spec_decode.utils import is_spec_decode_supported
 from vllm.v1.utils import bind_kv_cache
@@ -977,8 +978,29 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: Optional[IntermediateTensors] = None,
     ) -> Union[ModelRunnerOutput, torch.Tensor]:
-        
         print("[model_execution mode]")
+
+        ### NOTE: Custom SPEC DECODING implementation.
+        ### TODO: Basically append draft_tokens to the input_ids.
+        ### This will calculate everyhing all at once. Then the
+        ### length of draft_tokens used for speculative sampling.
+        verify_mode = scheduler_output.use_speculative_decoding and not scheduler_output.draft_mode
+        if verify_mode:
+            print("\n[verification mode]\n")
+            # NOTE: still assuming that only one request.
+            draft_tokens = list(scheduler_output.draft_tokens.values()) # we don't need tokens, actually
+            draft_logprobs = list(scheduler_output.draft_logprobs.values())
+            if draft_tokens:
+                draft_tokens = draft_tokens[0]
+                draft_logprobs = draft_logprobs[0]
+            else:
+                verify_mode = False
+        
+        else:
+            print("\n[draft mode]\n")
+            draft_tokens = None
+            draft_logprobs = None
+        
         self._update_states(scheduler_output)
         if not scheduler_output.total_num_scheduled_tokens:
             # Return empty ModelRunnerOuptut if there's no work to do.
@@ -1058,21 +1080,52 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # For mid-pipeline stages, return the hidden states.
             return hidden_states
 
-        hidden_states = hidden_states[:num_scheduled_tokens]
-        sample_hidden_states = hidden_states[logits_indices]
-        logits = self.model.compute_logits(sample_hidden_states, None)
+        # In verify mode, we need to extend the hidden states
+        if verify_mode:
+            # print(f"new scheduled:", num_scheduled_tokens, "->", len(draft_logprobs))
+            start = logits_indices.item() - len(draft_logprobs)
+            # TODO: investigate the config for this.
+            logits_indices = torch.arange(start, logits_indices.item() + 1, device=logits_indices.device, dtype=logits_indices.dtype)
+            print("new logits indices >", logits_indices)
+
+            hidden_states = hidden_states[:num_scheduled_tokens]
+            sample_hidden_states = hidden_states[logits_indices]
+            logits = self.model.compute_logits(sample_hidden_states, None)
+
+            print("input ids >", input_ids)
+            draft_tokens_tensor = input_ids[logits_indices][1:]
+            print("drafted input ids >", draft_tokens_tensor, "--", draft_tokens_tensor.shape)
+            print("resulting logits >", logits, "--", logits.shape)
+
+        else:
+            draft_tokens_tensor = None
+            hidden_states = hidden_states[:num_scheduled_tokens]
+            sample_hidden_states = hidden_states[logits_indices]
+            logits = self.model.compute_logits(sample_hidden_states, None)
+            
 
         # Apply structured output bitmasks if present
         if scheduler_output.grammar_bitmask is not None:
             self.apply_grammar_bitmask(scheduler_output, logits)
 
+        # Custom speculative sampling logic
+
         # Sample the next token and get logprobs if needed.
         sampling_metadata = self.input_batch.sampling_metadata
+        sampling_metadata.draft_token_ids = draft_tokens_tensor        
+        if verify_mode:
+            sampling_metadata.max_num_logprobs = 0 # we need the corresponding values
+        else:
+            pass
+        
+        print("sample metadata >", sampling_metadata)
+
         if spec_decode_metadata is None:
             sampler_output = self.model.sample(
                 logits=logits,
                 sampling_metadata=sampling_metadata,
             )
+            print("output >", sampler_output)
         else:
             # When indexing with a tensor (bonus_logits_indices), PyTorch
             # creates a new tensor with separate storage from the original
@@ -1119,31 +1172,90 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # NOTE: GPU -> CPU Sync happens here.
         # Move as many CPU operations as possible before this sync point.
         logprobs_tensors = sampler_output.logprobs_tensors
+        token_ids = sampler_output.sampled_token_ids.squeeze().tolist()
         logprobs_lists = logprobs_tensors.tolists() \
             if logprobs_tensors is not None else None
+        # logprobs output by the target model for the draft tokens
+        
+        # Rejection sampling is now done here.
+        log_alpha = -0.5
+        if verify_mode:
+            rejected = True
+            verified_tokens = []
+            sample_draft_logprobs_list = sampler_output.draft_logprobs_tensors.tolist()
+            print(" >>> target's independently sampled tokens:", token_ids) # [N+1] (extra token on the end)
+            print(" >>> draft logprobs by draft:", draft_logprobs) # [N]
+            print(" >>> draft logprobs by target:", sample_draft_logprobs_list) # [N]
+            for i in range(len(draft_logprobs)):
+                print(draft_tokens[i], "--", draft_logprobs[i], "--", sample_draft_logprobs_list[i])
+                diff = sample_draft_logprobs_list[i] - draft_logprobs[i]
+                print("log_p_target - log_p_draft:", diff)
 
-        # Compute prompt logprobs if needed.
-        prompt_logprobs_dict = self._get_prompt_logprobs_dict(
-            hidden_states,
-            scheduler_output,
-        )
+                if diff >= log_alpha:
+                    # immediately accept
+                    print(f"✓ Immediately accepted at position {i} ({draft_tokens[i]}): "
+                        f"log_p_target={sample_draft_logprobs_list[i]:.4f}, "
+                        f"log_p_draft={draft_logprobs[i]:.4f}")
+                    verified_tokens.append(draft_tokens[i])
+                else:
+                    accept_prob = np.exp(diff)  # This is p_target/p_draft
+                    random_value = random.random()  # Generate random number between 0 and 1
+                    
+                    if random_value < accept_prob:
+                        # Accept
+                        verified_tokens.append(draft_tokens[i])
+                        print(f"✓ Probabilistically accepted at position {i} ({draft_tokens[i]}): "
+                            f"log_p_target={sample_draft_logprobs_list[i]:.4f}, "
+                            f"log_p_draft={draft_logprobs[i]:.4f}, "
+                            f"accept_prob={accept_prob:.4f}, random_value={random_value:.4f}")
+                    else:
+                        # Reject
+                        print(f"✖️ Rejected at position {i} ({draft_tokens[i]}): "
+                            f"log_p_target={sample_draft_logprobs_list[i]:.4f}, "
+                            f"log_p_draft={draft_logprobs[i]:.4f}, "
+                            f"accept_prob={accept_prob:.4f}, random_value={random_value:.4f}")
+                        rejected = True
+                        break
 
-        # Get the valid generated tokens.
-        sampled_token_ids = sampler_output.sampled_token_ids
-        max_gen_len = sampled_token_ids.shape[-1]
-        if max_gen_len == 1:
-            # No spec decode tokens.
-            valid_sampled_token_ids = sampled_token_ids.tolist()
+            if rejected:
+                next_index = len(verified_tokens)
+                next_token = token_ids[next_index]  # token_ids is [draft_tokens + continuation]
+                verified_tokens.append(next_token)
+                prompt_logprobs_dict = {}
+            else:
+                print("✅ All draft tokens accepted")
+
+            print("🎉 Verified + continuation tokens:", verified_tokens)
+
+            # Since we hacked the logprobs out, we reset it back
+            logprobs_lists = None
+            valid_sampled_token_ids = [verified_tokens]
         else:
-            # Includes spec decode tokens.
-            valid_sampled_token_ids = self.rejection_sampler.parse_output(
-                sampled_token_ids,
-                self.input_batch.vocab_size,
-            )
-        # Mask out the sampled tokens that should not be sampled.
-        for i in discard_sampled_tokens_req_indices:
-            valid_sampled_token_ids[i].clear()
+            verified_tokens = None
 
+            # Compute prompt logprobs if needed.
+            prompt_logprobs_dict = self._get_prompt_logprobs_dict(
+                hidden_states,
+                scheduler_output,
+            )
+
+            # Get the valid generated tokens.
+            sampled_token_ids = sampler_output.sampled_token_ids
+            max_gen_len = sampled_token_ids.shape[-1]
+            if max_gen_len == 1:
+                # No spec decode tokens.
+                valid_sampled_token_ids = sampled_token_ids.tolist()
+            else:
+                # Includes spec decode tokens.
+                valid_sampled_token_ids = self.rejection_sampler.parse_output(
+                    sampled_token_ids,
+                    self.input_batch.vocab_size,
+                )
+            # Mask out the sampled tokens that should not be sampled.
+            for i in discard_sampled_tokens_req_indices:
+                valid_sampled_token_ids[i].clear()
+
+        # NOTE: this is VLLM's native spec decoding information. By default is skipped.
         if not self.use_spec_decode:
             # Speculative decoding is not enabled.
             spec_token_ids = None

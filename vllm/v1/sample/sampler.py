@@ -11,6 +11,8 @@ from vllm.v1.sample.ops.penalties import (apply_all_penalties,
                                           apply_min_token_penalties)
 from vllm.v1.sample.ops.topk_topp_sampler import TopKTopPSampler
 
+from typing import Optional
+
 _SAMPLING_EPS = 1e-5
 
 
@@ -57,7 +59,15 @@ class Sampler(nn.Module):
         # Get logprobs and rank tensors (if requested)
         logprobs_tensors = None if num_logprobs is None else \
             self.gather_logprobs(raw_logprobs, num_logprobs, token_ids=sampled)
-
+        
+        # torch.Size([drafted_tokens])
+        draft_token_ids = sampling_metadata.draft_token_ids
+        
+        if draft_token_ids is not None:            
+            draft_logprobs = raw_logprobs[:-1][torch.arange(draft_token_ids.size(0)), draft_token_ids]
+        else:
+            draft_logprobs = None
+            
         # Use int32 to reduce the tensor size.
         sampled = sampled.to(torch.int32)
 
@@ -68,6 +78,7 @@ class Sampler(nn.Module):
             # token per request.
             sampled_token_ids=sampled.unsqueeze(-1),
             logprobs_tensors=logprobs_tensors,
+            draft_logprobs_tensors=draft_logprobs
         )
         return sampler_output
 
@@ -118,7 +129,7 @@ class Sampler(nn.Module):
             sampling_metadata.top_k,
             sampling_metadata.top_p,
         )
-
+        
         if greedy_sampled is None:
             return random_sampled
 

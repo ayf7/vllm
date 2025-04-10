@@ -740,8 +740,8 @@ class CompletionRequest(OpenAIBaseModel):
     # doc: begin-speculative-decoding
     use_speculative_decoding: Optional[bool] = False # draft, below vars ignored if False
     draft_mode: Optional[bool] = False # if True, will use [max_tokens] to draft tokens
-    draft_tokens: Optional[list[int]] = None # denotes the number of tokesn in the last model that are drafts
-    draft_logits: Optional[list[float]] = None
+    draft_tokens: Optional[list[list[int]]] = None # denotes the number of tokesn in the last model that are drafts
+    draft_logits: Optional[list[list[float]]] = None
     # doc: end-speculative-decoding
 
     # doc: begin-completion-extra-params
