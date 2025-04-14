@@ -200,7 +200,14 @@ class AsyncLLM(EngineClient):
                                                 prompt_adapter_request,
                                                 priority)
 
-        print("\n\n--- ENGINE CORE REQUEST ---\n\n", request)
+        # print("prompt >", prompt)
+        # print("params >", params)
+        # print("params >", trace_headers)
+
+        if params.use_speculative_decoding and not params.draft_mode:
+            draft_tokens = params.draft_tokens[0]
+            prompt['prompt_token_ids'].extend(draft_tokens)
+        # print("\n\n--- ENGINE CORE REQUEST ---\n\n", request)
         if params.n == 1:
             await self._add_request(request, None, 0, queue)
             return queue

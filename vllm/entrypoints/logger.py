@@ -16,7 +16,7 @@ class RequestLogger:
     def __init__(self, *, max_log_len: Optional[int]) -> None:
         super().__init__()
 
-        self.max_log_len = max_log_len
+        self.max_log_len = 10
 
     def log_inputs(
         self,
@@ -33,12 +33,22 @@ class RequestLogger:
             if prompt is not None:
                 prompt = prompt[:max_log_len]
 
+            last_token = prompt_token_ids[-1]
             if prompt_token_ids is not None:
                 prompt_token_ids = prompt_token_ids[:max_log_len]
+        
+        # prompt_token_ids_end = [] if prompt_token_ids is None else prompt_token_ids[-self.max_log_len:]
 
-        logger.info(
-            "Received request %s: prompt: %r, "
-            "params: %s, prompt_token_ids: %s, "
-            "lora_request: %s, prompt_adapter_request: %s.", request_id,
-            prompt, params, prompt_token_ids, lora_request,
-            prompt_adapter_request)
+        # logger.info(
+        #     "Received request %s: prompt: %r, "
+        #     "params: %s, prompt_token_ids: %s...[%s], "
+        #     "lora_request: %s, prompt_adapter_request: %s.", request_id,
+        #     prompt, params, prompt_token_ids, last_token, lora_request,
+        #     prompt_adapter_request)
+
+
+
+# [32313, 11, 773, 358, 614, 419, 3491, 911, 35713, 78510]
+# [32313, 11, 773, 358, 614, 419, 3491, 911]
+
+# [1378, 2155, 5510, 315, 35713, 78510, 31175, 1119, 51424, 81720]

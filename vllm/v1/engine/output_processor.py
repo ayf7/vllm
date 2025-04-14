@@ -339,6 +339,7 @@ class OutputProcessor:
             if request_output := req_state.make_request_output(
                     new_token_ids, finish_reason, stop_reason):
                 if req_state.queue is not None:
+                    # print("\n\n ---- REQUEST OUTPUT ---- \n\n", request_output)
                     # AsyncLLM: put into queue for handling by generate().
                     req_state.queue.put(request_output)
                 else:

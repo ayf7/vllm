@@ -646,7 +646,9 @@ class Scheduler(SchedulerInterface):
             # Append generated tokens and check for stop. Note that if
             # a request is still being prefilled, we expect the model runner
             # to return empty token ids for the request.
+
             for num_new, output_token_id in enumerate(new_token_ids, 1):
+                # print(output_token_id)
                 request.append_output_token_ids(output_token_id)
 
                 # Check for stop and update request state.
@@ -656,6 +658,19 @@ class Scheduler(SchedulerInterface):
                     self._free_request(request)
                     del new_token_ids[num_new:]  # Trim new tokens if needed.
                     break
+            
+            
+            # force stop verift mode
+            verify_mode = scheduler_output.use_speculative_decoding and not scheduler_output.draft_mode
+            if verify_mode:
+                stopped = True
+                request.status = RequestStatus.FINISHED_STOPPED
+                # HACK: the draft output seemed to be 
+                request.append_output_token_ids(0) 
+                new_token_ids.append(0)
+                # request.stop_reason = last_token_id
+                self._free_request(request)
+                # print(request.output_token_ids)      
 
             # Extract sample logprobs if needed.
             if request.sampling_params.logprobs is not None and logprobs:
@@ -701,6 +716,7 @@ class Scheduler(SchedulerInterface):
             engine_core_outputs.finished_requests = (
                 scheduler_output.finished_req_ids | self.finished_req_ids)
 
+        # print("\n\n --- (scheduler.py) ENGINE CORE OUTPUTS --- \n\n", engine_core_outputs)
         return engine_core_outputs
 
     def add_request(self, request: Request) -> None:

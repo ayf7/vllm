@@ -155,7 +155,7 @@ class OpenAIServingCompletion(OpenAIServing):
                 trace_headers = (None if raw_request is None else await
                                  self._get_trace_headers(raw_request.headers))
 
-                print("CREATED SAMPLING PARAMS:", sampling_params)
+                # print("CREATED SAMPLING PARAMS:", sampling_params)
                 if isinstance(sampling_params, BeamSearchParams):
                     generator = self.engine_client.beam_search(
                         prompt=engine_prompt,
