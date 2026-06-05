@@ -1010,6 +1010,279 @@ class Scheduler(SchedulerInterface):
         if self.log_stats:
             session.record_event(EngineCoreEventType.QUEUED)
 
+    def splitreason_apply_streaming_delta(
+        self, request_id: str, token_ids: list[int]
+    ) -> dict:
+        """Extend a SplitReason warm-mirror request with new context in place.
+
+        Architecture D keeps an idle-model "warm mirror" of every cooperative
+        request: while one model decodes, the other model's mirror is extended
+        with the freshly produced (tag-stripped) tokens and runs only prefill
+        over the delta, so its KV cache stays warm for an instant handoff. This
+        is the scheduler-side primitive the host coordinator calls between
+        engine steps to apply that delta and re-queue the mirror.
+
+        It is intentionally close to vLLM's streaming-session continuation
+        (`_update_request_as_session`) but differs in one load-bearing way: it
+        must NOT delete the uncomputed trailing tokens. `_update_request_as_session`
+        discards `_all_token_ids[num_computed_tokens:]` because a stopped chat
+        turn drops the model's last just-sampled token before the next user
+        message. A warm mirror is instead deliberately kept mid-prefill with
+        queued-but-uncomputed tokens (the keep-prefilling invariant from M2a),
+        and those are real context: dropping them would silently lose tokens and
+        desync the mirror from the decoding side. So this method folds any
+        committed output into the prompt (the worker's `_update_streaming_request`
+        rebuilds context from `new_req_data.prompt_token_ids` and clears
+        `output_token_ids`, so the full sequence must live in `prompt_token_ids`)
+        and appends the delta, while preserving both the uncomputed tail and
+        `num_computed_tokens` (the warm prefix).
+
+        The request is returned to WAITING so the next `schedule()` computes only
+        `num_tokens - num_computed_tokens` (the queued tail plus the delta) and
+        appends delta blocks to the already-allocated prefix blocks. If it was
+        RUNNING we remove it from `self.running` here, mirroring the same-pass
+        running cleanup the stock stopped-streaming path performs at
+        `_update_from_output`. The KV blocks are never freed, so this is not a
+        preemption: it keeps the warm-cache invariant `_preempt_request` would
+        destroy by resetting `num_computed_tokens = 0`.
+
+        Phase 1 rejects advanced features (structured output, speculative
+        decode, multimodal, pooling, async-scheduling placeholders, and
+        prompt_embeds); they widen the correctness surface and are disabled for
+        cooperative requests.
+        """
+        request = self.requests.get(request_id)
+        if request is None:
+            raise KeyError(f"unknown request_id {request_id!r}")
+        if request.status not in (
+            RequestStatus.RUNNING,
+            RequestStatus.WAITING,
+            RequestStatus.WAITING_FOR_STREAMING_REQ,
+        ):
+            raise ValueError(
+                f"cannot apply a streaming delta to request {request_id!r} in "
+                f"status {request.status}"
+            )
+        if request.prompt_token_ids is None:
+            raise ValueError(
+                "cooperative warm mirror requires token prompts (prompt_embeds "
+                "are not supported)"
+            )
+        if request.use_structured_output:
+            raise ValueError(
+                "structured output is not supported for cooperative requests"
+            )
+        if request.pooling_params is not None:
+            raise ValueError("pooling is not supported for cooperative requests")
+        if request.mm_features:
+            raise ValueError(
+                "multimodal inputs are not supported for cooperative requests"
+            )
+        if request.spec_token_ids:
+            raise ValueError(
+                "speculative decode is not supported for cooperative requests"
+            )
+        if request.num_output_placeholders or request.discard_latest_async_tokens:
+            raise ValueError(
+                "async-scheduling placeholders are not supported for cooperative "
+                "requests"
+            )
+        # A re-queued warm mirror must have at least one uncomputed token or the
+        # next schedule() asserts num_new_tokens > 0 (scheduler.py ~670) and
+        # crashes in an unrelated stack. The only way to reach that is an empty
+        # delta applied to a mirror whose whole sequence is already computed (no
+        # queued tail) — a coordinator no-op. num_computed_tokens never exceeds
+        # the sequence length, so this is <= 0 only in exactly that case. Reject
+        # it here so the failure is reported at the call site, not deferred.
+        prospective_tail = (
+            len(request._all_token_ids)
+            + len(token_ids)
+            - request.num_computed_tokens
+        )
+        if prospective_tail <= 0:
+            raise ValueError(
+                f"streaming delta would leave request {request_id!r} with no "
+                f"uncomputed tokens to schedule ({request.num_computed_tokens} "
+                f"computed of {len(request._all_token_ids)}, empty delta); a warm "
+                "mirror must keep at least one queued token"
+            )
+
+        delta = [int(t) for t in token_ids]
+        prompt = request.prompt_token_ids
+        all_ids = request._all_token_ids
+        # Fold any committed output into the prompt so prompt_token_ids carries
+        # the full context. _all_token_ids is always prompt + output in order,
+        # so prompt is a prefix of it; extend prompt to cover the whole current
+        # sequence (NOT truncating at num_computed_tokens — that is the
+        # destructive step we must avoid), then clear the output view.
+        if len(prompt) < len(all_ids):
+            prompt.extend(all_ids[len(prompt) :])
+        request._output_token_ids.clear()
+        # Append the streaming delta to both lists in lockstep so they stay
+        # identical (all-prompt) and the uncomputed tail is preserved.
+        all_ids.extend(delta)
+        prompt.extend(delta)
+        request.num_prompt_tokens = len(prompt)
+        request.update_block_hashes()
+
+        was_running = request.status == RequestStatus.RUNNING
+        if request.status == RequestStatus.WAITING_FOR_STREAMING_REQ:
+            self.num_waiting_for_streaming_input -= 1
+        request.status = RequestStatus.WAITING
+        if was_running:
+            # A RUNNING mirror is not in self.waiting yet: enqueue it and drop
+            # it from self.running (mirroring the stop path's same-pass running
+            # cleanup — a request put back to WAITING must not also remain in
+            # running). A request that was already WAITING or
+            # WAITING_FOR_STREAMING_REQ is ALREADY in self.waiting; re-adding it
+            # would leave a second reference in the queue, and the next
+            # schedule() would pop the duplicate after the first copy is set
+            # RUNNING and crash on the "Invalid request status" guard. So only a
+            # RUNNING mirror is enqueued here; an already-waiting one is mutated
+            # in place and keeps its single queue slot.
+            self.waiting.add_request(request)
+            self.running = remove_all(self.running, {request})
+        if self.log_stats:
+            request.record_event(EngineCoreEventType.QUEUED)
+
+        return {
+            "request_id": request_id,
+            "num_computed_tokens": request.num_computed_tokens,
+            "num_tokens": request.num_tokens,
+            "num_new_tokens": request.num_tokens - request.num_computed_tokens,
+            "delta_len": len(delta),
+            "was_running": was_running,
+            "status": str(request.status),
+        }
+
+    def splitreason_request_view_lengths(
+        self, request_id: str, prompt_len: int, open_id: int, close_id: int
+    ) -> dict:
+        """Measure a cooperative request's small/large view lengths from the
+        scheduler's own token state — the authoritative source the next prefill
+        will run over.
+
+        The SplitReason tap tracks each request's small-view and large-view
+        lengths incrementally as it sees sampled tokens, but it goes blind
+        during an offload span: the small mirror's boundary samples are
+        discarded prefill (not counted), and the large-authored tokens are
+        folded into the mirror's prompt by ``splitreason_apply_streaming_delta``
+        without ever passing the tap. The coordinator calls this between steps
+        to rebind the tap's lengths to ground truth before trusting a close
+        event's view indices.
+
+        ``prompt_len`` is the original prompt length (before any generation), so
+        ``_all_token_ids[prompt_len:]`` is the full generated suffix in the small
+        model's own token space: small-authored tokens with their control ids
+        plus folded large-authored (already control-free) tokens. The small view
+        counts the whole suffix; the large view strips the two control ids. This
+        mirrors splitreason.inference.tokenizer_views.derive_view_lengths exactly
+        (kept inline here to avoid importing the splitreason package into vLLM).
+        """
+        request = self.requests.get(request_id)
+        if request is None:
+            raise KeyError(f"unknown request_id {request_id!r}")
+        all_ids = request._all_token_ids
+        if prompt_len < 0 or prompt_len > len(all_ids):
+            raise ValueError(
+                f"prompt_len {prompt_len} out of range for request {request_id!r} "
+                f"with {len(all_ids)} tokens"
+            )
+        suffix = all_ids[prompt_len:]
+        small_view_len = len(suffix)
+        large_view_len = sum(1 for t in suffix if t != open_id and t != close_id)
+        return {
+            "request_id": request_id,
+            "small_view_len": small_view_len,
+            "large_view_len": large_view_len,
+            "num_tokens": len(all_ids),
+            "prompt_len": prompt_len,
+        }
+
+    def splitreason_request_token_ids(self, request_id: str) -> dict:
+        """Return a copy of one request's scheduler token state for validation.
+
+        This is a read-only M2c parity hook. It deliberately copies the lists so
+        callers cannot mutate scheduler-owned request state through the utility
+        RPC result.
+        """
+        request = self.requests.get(request_id)
+        if request is None:
+            raise KeyError(f"unknown request_id {request_id!r}")
+        return {
+            "request_id": request_id,
+            "all_token_ids": list(request._all_token_ids),
+            "prompt_token_ids": list(request.prompt_token_ids or ()),
+            "output_token_ids": list(request._output_token_ids),
+            "num_computed_tokens": int(request.num_computed_tokens),
+            "num_tokens": int(request.num_tokens),
+            "status": str(request.status),
+        }
+
+    def splitreason_arm_decode(self, request_id: str) -> dict:
+        """Arm a fully caught-up warm mirror to emit its next token as a KEPT decode.
+
+        This is the un-gate half of an offload handoff. While the other model
+        decodes, this engine keep-prefills a force-discarded warm mirror, so after
+        its last gated step the mirror is exactly caught up: num_computed_tokens ==
+        num_tokens, nothing queued. When ownership flips to THIS engine the mirror
+        must drop into decode and commit the first token of the offloaded span.
+
+        Two facts make a raw step insufficient. First, vLLM keeps a sampled token
+        iff the request fully catches up on that step -- the worker's discard bit is
+        (seq_lens < num_tokens) at gpu_model_runner.py, so a sample is dropped while
+        still mid-prefill. Second, the scheduler assigns num_new_tokens =
+        num_tokens_with_spec - num_computed_tokens, which is 0 for a caught-up
+        mirror, so it would not be scheduled at all. Rewinding num_computed_tokens by
+        one gives it exactly one uncomputed token: the next schedule() re-runs that
+        single position (its KV block is already allocated from the warm-keep, so no
+        new block is needed and the recomputed KV is identical -- the standard
+        final-prefill-token -> first-decode mechanic), seq_lens reaches num_tokens,
+        the discard bit is False, and the sampled continuation token is KEPT and
+        appended. From the following step the mirror decodes normally (num_new == 1).
+
+        Fail loud. The mirror must be exactly caught up; a still-mid-prefill mirror
+        (num_computed < num_tokens) has queued tokens that must be computed first and
+        is not ours to arm, and num_computed > num_tokens is impossible without
+        corruption. Speculative tokens change num_tokens_with_spec out from under the
+        one-token rewind, so they are rejected like the other cooperative-request
+        unsupported features. Either way the cause is a coordinator bug, surfaced
+        here rather than as a silently wrong handoff downstream.
+        """
+        request = self.requests.get(request_id)
+        if request is None:
+            raise KeyError(f"unknown request_id {request_id!r}")
+        if request.status not in (RequestStatus.RUNNING, RequestStatus.WAITING):
+            raise ValueError(
+                f"cannot arm request {request_id!r} for decode in status "
+                f"{request.status}; it must be a scheduled (RUNNING) or queued "
+                "(WAITING) warm mirror"
+            )
+        if request.spec_token_ids:
+            raise ValueError(
+                "speculative decode is not supported for cooperative requests"
+            )
+        num_tokens = request.num_tokens
+        if num_tokens < 1:
+            raise ValueError(
+                f"cannot arm request {request_id!r} with no tokens to decode from"
+            )
+        if request.num_computed_tokens != num_tokens:
+            raise ValueError(
+                f"arm_decode requires a fully caught-up warm mirror, but request "
+                f"{request_id!r} has num_computed_tokens="
+                f"{request.num_computed_tokens} of num_tokens={num_tokens}; step the "
+                "mirror to catch up (or it is mid-prefill and not ready to hand off)"
+            )
+        request.num_computed_tokens = num_tokens - 1
+        return {
+            "request_id": request_id,
+            "num_computed_tokens": request.num_computed_tokens,
+            "num_tokens": num_tokens,
+            "num_new_tokens": num_tokens - request.num_computed_tokens,
+            "status": str(request.status),
+        }
+
     def _make_cached_request_data(
         self,
         running_reqs: list[Request],

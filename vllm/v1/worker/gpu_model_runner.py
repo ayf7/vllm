@@ -1681,6 +1681,23 @@ class GPUModelRunner(
         self.discard_request_mask.np[:num_reqs] = (
             self.seq_lens.np[:num_reqs] < num_tokens_np
         )
+        # SplitReason cooperative-decode gate. No-op unless a tap was attached by
+        # the worker extension (splitreason.inference.vllm_extension). A warm
+        # mirror this engine does not currently own must never commit a
+        # self-sampled token: the natural discard bit just above is
+        # (seq_lens < num_tokens), which flips to False on the exact step a
+        # mirror's queued tail catches up — at which point vLLM would commit its
+        # own predicted token and the coordinator's next streaming-delta fold
+        # would make that pollution permanent. Forcing those rows back to
+        # discarded here, before the copy_to_gpu below and before
+        # _bookkeeping_sync snapshots this mask into discard_sampled_tokens_req_
+        # indices, pins the passive mirror so its committed suffix is exactly the
+        # forwarded stream (the keep-prefilling invariant, enforced not assumed).
+        splitreason_tap = getattr(self, "splitreason_tap", None)
+        if splitreason_tap is not None:
+            splitreason_tap.apply_gate_to_discard_mask(
+                self.discard_request_mask.np[:num_reqs], self.input_batch.req_ids
+            )
         self.discard_request_mask.copy_to_gpu(num_reqs)
 
         # Copy the tensors to the GPU.
@@ -3020,6 +3037,32 @@ class GPUModelRunner(
 
         num_sampled_tokens = sampler_output.sampled_token_ids.shape[0]
         sampled_token_ids = sampler_output.sampled_token_ids
+
+        # SplitReason cooperative-decode tap. No-op unless a tap was attached by
+        # the worker extension (splitreason.inference.vllm_extension). The
+        # sampled ids are still a GPU tensor here, before _to_list() copies them
+        # to host and before discarded rows are cleared just below, so the small
+        # controller can read the <bigmodel>/</bigmodel> boundary token. The
+        # discard mask is read from the host-side .np view, which vLLM populated
+        # this step (gpu_model_runner _prepare_inputs) and itself reads a few
+        # lines down, so only the sampled-token tensor still needs a host copy.
+        # Coop engines run with async scheduling disabled (EngineSpec.to_vllm_
+        # kwargs sets async_scheduling=False) because the control loop needs the
+        # sampled token on the host this step; async mode defers that copy to a
+        # side stream and would break the per-step gating. In this sync mode the
+        # _to_list() below still runs unconditionally, so the tap's first-token
+        # copy here is a SECOND device->host sync on top of it, not a replacement
+        # — acceptable for M2a bring-up; collapsing the two (have the tap read
+        # the already-copied valid_sampled_token_ids) is an M2c hot-path item.
+        splitreason_tap = getattr(self, "splitreason_tap", None)
+        if splitreason_tap is not None:
+            splitreason_tap.on_sampled_token_ids(
+                sampled_token_ids=sampled_token_ids,
+                discard_request_mask=self.discard_request_mask.np[:num_reqs],
+                req_ids=self.input_batch.req_ids,
+                req_id_to_index=self.input_batch.req_id_to_index,
+            )
+
         logprobs_tensors = sampler_output.logprobs_tensors
         invalid_req_indices = []
         logprobs_lists = None

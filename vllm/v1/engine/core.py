@@ -732,6 +732,47 @@ class EngineCore:
     ) -> list[_R]:
         return self.model_executor.collective_rpc(method, timeout, args, kwargs)
 
+    def splitreason_apply_streaming_delta(
+        self, request_id: str, token_ids: list[int]
+    ) -> dict:
+        """Forward a SplitReason warm-mirror delta to the engine-core scheduler.
+
+        The scheduler lives in this (engine-core) process, while the coordinator
+        runs in the host process, so this thin forwarder is reached via the
+        client's `call_utility` path (the UTILITY dispatch resolves it with
+        `getattr(self, method_name)`). It does not touch workers, so it goes
+        through utility RPC rather than collective_rpc.
+        """
+        return self.scheduler.splitreason_apply_streaming_delta(request_id, token_ids)
+
+    def splitreason_request_view_lengths(
+        self, request_id: str, prompt_len: int, open_id: int, close_id: int
+    ) -> dict:
+        """Forward a SplitReason view-length read to the engine-core scheduler.
+
+        Like splitreason_apply_streaming_delta this is a scheduler read that
+        lives in the engine-core process, reached from the host coordinator via
+        the client's `call_utility` path (positional args). It touches no
+        workers, so it goes through utility RPC rather than collective_rpc.
+        """
+        return self.scheduler.splitreason_request_view_lengths(
+            request_id, prompt_len, open_id, close_id
+        )
+
+    def splitreason_request_token_ids(self, request_id: str) -> dict:
+        """Forward a read-only SplitReason token-state read to the scheduler."""
+        return self.scheduler.splitreason_request_token_ids(request_id)
+
+    def splitreason_arm_decode(self, request_id: str) -> dict:
+        """Forward a SplitReason un-gate arm to the engine-core scheduler.
+
+        Like the other splitreason_* forwarders this is a scheduler mutation that
+        lives in the engine-core process, reached from the host coordinator via the
+        client's `call_utility` path (positional args). It touches no workers, so it
+        goes through utility RPC rather than collective_rpc.
+        """
+        return self.scheduler.splitreason_arm_decode(request_id)
+
     def preprocess_add_request(self, request: EngineCoreRequest) -> tuple[Request, int]:
         """Preprocess the request.
 
