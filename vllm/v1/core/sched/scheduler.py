@@ -1155,6 +1155,23 @@ class Scheduler(SchedulerInterface):
             "status": str(request.status),
         }
 
+    def splitreason_apply_streaming_delta_batch(
+        self, updates: list[dict]
+    ) -> list[dict]:
+        """Batch version of splitreason_apply_streaming_delta.
+
+        The host coordinator applies one warm-mirror delta for many requests in
+        a decode tick. Looping here keeps scheduler semantics identical while
+        amortizing the utility-RPC hop over the whole batch.
+        """
+        return [
+            self.splitreason_apply_streaming_delta(
+                str(update["request_id"]),
+                list(update.get("token_ids", ())),
+            )
+            for update in updates
+        ]
+
     def splitreason_request_view_lengths(
         self, request_id: str, prompt_len: int, open_id: int, close_id: int
     ) -> dict:
@@ -1198,6 +1215,20 @@ class Scheduler(SchedulerInterface):
             "num_tokens": len(all_ids),
             "prompt_len": prompt_len,
         }
+
+    def splitreason_request_view_lengths_batch(
+        self, requests: list[dict]
+    ) -> list[dict]:
+        """Batch version of splitreason_request_view_lengths."""
+        return [
+            self.splitreason_request_view_lengths(
+                str(item["request_id"]),
+                int(item["prompt_len"]),
+                int(item["open_id"]),
+                int(item["close_id"]),
+            )
+            for item in requests
+        ]
 
     def splitreason_request_token_ids(self, request_id: str) -> dict:
         """Return a copy of one request's scheduler token state for validation.
@@ -1282,6 +1313,13 @@ class Scheduler(SchedulerInterface):
             "num_new_tokens": num_tokens - request.num_computed_tokens,
             "status": str(request.status),
         }
+
+    def splitreason_arm_decode_batch(self, request_ids: list[str]) -> list[dict]:
+        """Batch version of splitreason_arm_decode."""
+        return [
+            self.splitreason_arm_decode(str(request_id))
+            for request_id in request_ids
+        ]
 
     def _make_cached_request_data(
         self,

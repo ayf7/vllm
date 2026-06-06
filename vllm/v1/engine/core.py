@@ -745,6 +745,12 @@ class EngineCore:
         """
         return self.scheduler.splitreason_apply_streaming_delta(request_id, token_ids)
 
+    def splitreason_apply_streaming_delta_batch(
+        self, updates: list[dict]
+    ) -> list[dict]:
+        """Forward a batch of SplitReason warm-mirror deltas to the scheduler."""
+        return self.scheduler.splitreason_apply_streaming_delta_batch(updates)
+
     def splitreason_request_view_lengths(
         self, request_id: str, prompt_len: int, open_id: int, close_id: int
     ) -> dict:
@@ -759,6 +765,12 @@ class EngineCore:
             request_id, prompt_len, open_id, close_id
         )
 
+    def splitreason_request_view_lengths_batch(
+        self, requests: list[dict]
+    ) -> list[dict]:
+        """Forward a batch of SplitReason view-length reads to the scheduler."""
+        return self.scheduler.splitreason_request_view_lengths_batch(requests)
+
     def splitreason_request_token_ids(self, request_id: str) -> dict:
         """Forward a read-only SplitReason token-state read to the scheduler."""
         return self.scheduler.splitreason_request_token_ids(request_id)
@@ -772,6 +784,10 @@ class EngineCore:
         goes through utility RPC rather than collective_rpc.
         """
         return self.scheduler.splitreason_arm_decode(request_id)
+
+    def splitreason_arm_decode_batch(self, request_ids: list[str]) -> list[dict]:
+        """Forward a batch of SplitReason un-gate arms to the scheduler."""
+        return self.scheduler.splitreason_arm_decode_batch(request_ids)
 
     def preprocess_add_request(self, request: EngineCoreRequest) -> tuple[Request, int]:
         """Preprocess the request.
