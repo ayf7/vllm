@@ -110,7 +110,12 @@ from vllm.renderers.inputs.preprocess import (
     parse_model_prompt,
     prompt_to_seq,
 )
-from vllm.sampling_params import BeamSearchParams, SamplingParams
+from vllm.sampling_params import (
+    PROBE_VOCAB_LOGPROBS_KEY,
+    PROBE_VOCAB_LOGPROBS_LAST_N_KEY,
+    BeamSearchParams,
+    SamplingParams,
+)
 from vllm.tokenizers import TokenizerLike
 from vllm.tool_parsers import ToolParser
 from vllm.tracing import (
@@ -242,6 +247,23 @@ class OpenAIServing:
         self.renderer = engine_client.renderer
         self.io_processor = engine_client.io_processor
         self.input_processor = engine_client.input_processor
+
+    def _attach_probe_vocab_logprobs(
+        self,
+        request: Any,
+        sampling_params: SamplingParams,
+    ) -> None:
+        probe_items = getattr(request, PROBE_VOCAB_LOGPROBS_KEY, None)
+        if probe_items is None:
+            return
+
+        extra_args = dict(sampling_params.extra_args or {})
+        extra_args[PROBE_VOCAB_LOGPROBS_KEY] = list(probe_items)
+        extra_args[PROBE_VOCAB_LOGPROBS_LAST_N_KEY] = int(
+            getattr(request, PROBE_VOCAB_LOGPROBS_LAST_N_KEY)
+        )
+        sampling_params.extra_args = extra_args
+        sampling_params._validate_logprobs(self.model_config)
 
     async def beam_search(
         self,

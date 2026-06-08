@@ -95,7 +95,11 @@ from vllm.multimodal.inputs import (
 )
 from vllm.multimodal.utils import group_mm_kwargs_by_modality
 from vllm.pooling_params import PoolingParams
-from vllm.sampling_params import SamplingType
+from vllm.sampling_params import (
+    PROBE_VOCAB_LOGPROBS_KEY,
+    PROBE_VOCAB_LOGPROBS_LAST_N_KEY,
+    SamplingType,
+)
 from vllm.sequence import IntermediateTensors
 from vllm.tasks import GenerationTask, PoolingTask, SupportedTask
 from vllm.tracing import instrument
@@ -546,6 +550,8 @@ class GPUModelRunner(
         # NOTE(rob): num_prompt_logprobs only includes reqs
         # that are currently in the prefill phase.
         self.num_prompt_logprobs: dict[str, int] = {}
+        self.prompt_probe_logprobs: dict[str, tuple[list[int], int]] = {}
+        self.in_progress_prompt_probe_logprobs: dict[str, list[dict[str, Any]]] = {}
         self.comm_stream = torch.cuda.Stream()
 
         # Input Batch
@@ -963,6 +969,8 @@ class GPUModelRunner(
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)
             self.num_prompt_logprobs.pop(req_id, None)
+            self.prompt_probe_logprobs.pop(req_id, None)
+            self.in_progress_prompt_probe_logprobs.pop(req_id, None)
         # Remove the finished requests from the persistent batch.
         # NOTE(woosuk): There could be an edge case where finished_req_ids and
         # scheduled_req_ids overlap. This happens when a request is aborted and
@@ -1055,6 +1063,19 @@ class GPUModelRunner(
                     if sampling_params.prompt_logprobs == -1
                     else sampling_params.prompt_logprobs
                 )
+            if sampling_params and sampling_params.extra_args:
+                probe_token_ids = sampling_params.extra_args.get(
+                    PROBE_VOCAB_LOGPROBS_KEY
+                )
+                if probe_token_ids is not None:
+                    last_n_tokens = sampling_params.extra_args[
+                        PROBE_VOCAB_LOGPROBS_LAST_N_KEY
+                    ]
+                    self.prompt_probe_logprobs[req_id] = (
+                        list(probe_token_ids),
+                        int(last_n_tokens),
+                    )
+                    self.in_progress_prompt_probe_logprobs[req_id] = []
 
             # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
             if self.uses_mrope:
@@ -3142,12 +3163,17 @@ class GPUModelRunner(
             hidden_states[:num_scheduled_tokens],
             scheduler_output.num_scheduled_tokens,
         )
+        prompt_probe_logprobs_dict = self._get_prompt_probe_logprobs_dict(
+            hidden_states[:num_scheduled_tokens],
+            scheduler_output.num_scheduled_tokens,
+        )
 
         return (
             num_nans_in_logits,
             logprobs_lists,
             valid_sampled_token_ids,
             prompt_logprobs_dict,
+            prompt_probe_logprobs_dict,
             req_ids_output_copy,
             req_id_to_index_output_copy,
             invalid_req_indices,
@@ -3892,6 +3918,7 @@ class GPUModelRunner(
                 logprobs_lists,
                 valid_sampled_token_ids,
                 prompt_logprobs_dict,
+                prompt_probe_logprobs_dict,
                 req_ids_output_copy,
                 req_id_to_index_output_copy,
                 invalid_req_indices,
@@ -3936,6 +3963,7 @@ class GPUModelRunner(
                 sampled_token_ids=valid_sampled_token_ids,
                 logprobs=logprobs_lists,
                 prompt_logprobs_dict=prompt_logprobs_dict,
+                prompt_probe_logprobs_dict=prompt_probe_logprobs_dict,
                 kv_connector_output=kv_connector_output,
                 ec_connector_output=ec_connector_output
                 if self.supports_mm_inputs
@@ -4682,6 +4710,124 @@ class GPUModelRunner(
             self._sync_device()
 
         return prompt_logprobs_dict
+
+    def _get_prompt_probe_logprobs_dict(
+        self,
+        hidden_states: torch.Tensor,
+        num_scheduled_tokens: dict[str, int],
+    ) -> dict[str, list[dict[str, Any]]]:
+        probe_config_dict = self.prompt_probe_logprobs
+        if not probe_config_dict:
+            return {}
+
+        prompt_probe_logprobs_dict: dict[str, list[dict[str, Any]]] = {}
+        completed_prefill_reqs = []
+        probe_hidden_state_chunks: list[torch.Tensor] = []
+        row_metadata: list[tuple[str, int, list[int]]] = []
+        unique_probe_token_ids: dict[int, None] = {}
+        for req_id, (probe_token_ids, last_n_tokens) in probe_config_dict.items():
+            num_tokens = num_scheduled_tokens.get(req_id)
+            if num_tokens is None:
+                continue
+
+            request = self.requests[req_id]
+            if request.prompt_token_ids is None:
+                continue
+
+            num_prompt_tokens = len(request.prompt_token_ids)
+            if num_prompt_tokens == 0:
+                completed_prefill_reqs.append(req_id)
+                prompt_probe_logprobs_dict[req_id] = []
+                continue
+
+            start_idx = request.num_computed_tokens
+            scheduled_prompt_tokens = max(
+                0, min(int(num_tokens), num_prompt_tokens - start_idx)
+            )
+            current_start = start_idx
+            current_end = start_idx + scheduled_prompt_tokens
+
+            probe_start = max(0, num_prompt_tokens - last_n_tokens)
+            probe_end = num_prompt_tokens
+            overlap_start = max(probe_start, current_start)
+            overlap_end = min(probe_end, current_end)
+
+            if overlap_start < overlap_end:
+                req_idx = self.input_batch.req_id_to_index[req_id]
+                offset = int(self.query_start_loc.np[req_idx])
+                row_start = overlap_start - current_start
+                row_end = overlap_end - current_start
+                probe_hidden_state_chunks.append(
+                    hidden_states[offset + row_start : offset + row_end]
+                )
+                for position in range(overlap_start, overlap_end):
+                    row_metadata.append((req_id, position, probe_token_ids))
+                for token_id in probe_token_ids:
+                    unique_probe_token_ids[int(token_id)] = None
+
+            if current_end >= num_prompt_tokens:
+                completed_prefill_reqs.append(req_id)
+
+        if probe_hidden_state_chunks:
+            records_by_req_id = self._compute_prompt_probe_logprob_records(
+                torch.cat(probe_hidden_state_chunks, dim=0),
+                row_metadata=row_metadata,
+                probe_token_ids=list(unique_probe_token_ids.keys()),
+            )
+            for req_id, records in records_by_req_id.items():
+                self.in_progress_prompt_probe_logprobs.setdefault(req_id, []).extend(
+                    records
+                )
+
+        for req_id in completed_prefill_reqs:
+            if req_id in self.in_progress_prompt_probe_logprobs:
+                prompt_probe_logprobs_dict[req_id] = (
+                    self.in_progress_prompt_probe_logprobs[req_id]
+                )
+            del probe_config_dict[req_id]
+            self.in_progress_prompt_probe_logprobs.pop(req_id, None)
+
+        return prompt_probe_logprobs_dict
+
+    def _compute_prompt_probe_logprob_records(
+        self,
+        hidden_states: torch.Tensor,
+        *,
+        row_metadata: list[tuple[str, int, list[int]]],
+        probe_token_ids: list[int],
+    ) -> dict[str, list[dict[str, Any]]]:
+        if hidden_states.shape[0] != len(row_metadata):
+            raise ValueError(
+                "prompt probe hidden-state rows and metadata are misaligned: "
+                f"{hidden_states.shape[0]} rows for {len(row_metadata)} metadata rows"
+            )
+
+        logits = self.model.compute_logits(hidden_states)
+        token_ids = torch.tensor(probe_token_ids, device=self.device, dtype=torch.long)
+        selected_logits = logits[:, token_ids].to(torch.float32)
+        selected_logprobs = selected_logits - torch.logsumexp(
+            logits.to(torch.float32), dim=-1, keepdim=True
+        )
+
+        selected_logits_cpu = selected_logits.detach().cpu().tolist()
+        selected_logprobs_cpu = selected_logprobs.detach().cpu().tolist()
+        token_id_to_col = {token_id: col for col, token_id in enumerate(probe_token_ids)}
+
+        records_by_req_id: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for (req_id, position, row_token_ids), row_logits, row_logprobs in zip(
+            row_metadata, selected_logits_cpu, selected_logprobs_cpu, strict=True
+        ):
+            for token_id in row_token_ids:
+                col = token_id_to_col[int(token_id)]
+                records_by_req_id[req_id].append(
+                    {
+                        "position": int(position),
+                        "token_id": int(token_id),
+                        "logit": float(row_logits[col]),
+                        "logprob": float(row_logprobs[col]),
+                    }
+                )
+        return records_by_req_id
 
     def _get_nans_in_logits(
         self,

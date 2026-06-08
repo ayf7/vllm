@@ -37,6 +37,8 @@ from vllm.logger import init_logger
 from vllm.logprobs import Logprob
 from vllm.renderers import ChatParams, TokenizeParams, merge_kwargs
 from vllm.sampling_params import (
+    PROBE_VOCAB_LOGPROBS_KEY,
+    PROBE_VOCAB_LOGPROBS_LAST_N_KEY,
     BeamSearchParams,
     RepetitionDetectionParams,
     RequestOutputKind,
@@ -106,6 +108,7 @@ class ChatCompletionResponse(OpenAIBaseModel):
 
     # vLLM-specific fields that are not in OpenAI spec
     prompt_logprobs: list[dict[int, Logprob] | None] | None = None
+    probe_vocab_logprobs: list[dict[str, Any]] | None = None
     prompt_token_ids: list[int] | None = None
     kv_transfer_params: dict[str, Any] | None = Field(
         default=None, description="KVTransfer parameters."
@@ -202,6 +205,8 @@ class ChatCompletionRequest(OpenAIBaseModel):
         None
     )
     prompt_logprobs: int | None = None
+    probe_vocab_logprobs: list[int] | None = None
+    probe_vocab_logprobs_last_n_tokens: int | None = None
     allowed_token_ids: list[int] | None = None
     bad_words: list[str] = Field(default_factory=list)
     # --8<-- [end:chat-completion-sampling-params]
@@ -555,6 +560,8 @@ class ChatCompletionRequest(OpenAIBaseModel):
     @model_validator(mode="before")
     @classmethod
     def check_logprobs(cls, data):
+        if not isinstance(data, dict):
+            return data
         if (prompt_logprobs := data.get("prompt_logprobs")) is not None:
             if data.get("stream") and (prompt_logprobs > 0 or prompt_logprobs == -1):
                 raise VLLMValidationError(
@@ -580,6 +587,44 @@ class ChatCompletionRequest(OpenAIBaseModel):
                 raise VLLMValidationError(
                     "when using `top_logprobs`, `logprobs` must be set to true.",
                     parameter="top_logprobs",
+                )
+
+        probe_vocab_logprobs = data.get(PROBE_VOCAB_LOGPROBS_KEY)
+        probe_last_n = data.get(PROBE_VOCAB_LOGPROBS_LAST_N_KEY)
+        if probe_vocab_logprobs is not None or probe_last_n is not None:
+            if data.get("use_beam_search"):
+                raise VLLMValidationError(
+                    "`probe_vocab_logprobs` are not supported with beam search.",
+                    parameter=PROBE_VOCAB_LOGPROBS_KEY,
+                )
+            if data.get("stream"):
+                raise VLLMValidationError(
+                    "`probe_vocab_logprobs` are not available when `stream=True`.",
+                    parameter=PROBE_VOCAB_LOGPROBS_KEY,
+                )
+            if not isinstance(probe_vocab_logprobs, list) or not probe_vocab_logprobs:
+                raise VLLMValidationError(
+                    "`probe_vocab_logprobs` must be a non-empty list.",
+                    parameter=PROBE_VOCAB_LOGPROBS_KEY,
+                    value=probe_vocab_logprobs,
+                )
+            if not all(isinstance(token_id, int) for token_id in probe_vocab_logprobs):
+                raise VLLMValidationError(
+                    "`probe_vocab_logprobs` must contain only token ids.",
+                    parameter=PROBE_VOCAB_LOGPROBS_KEY,
+                    value=probe_vocab_logprobs,
+                )
+            if any(token_id < 0 for token_id in probe_vocab_logprobs):
+                raise VLLMValidationError(
+                    "`probe_vocab_logprobs` token ids must be non-negative.",
+                    parameter=PROBE_VOCAB_LOGPROBS_KEY,
+                    value=probe_vocab_logprobs,
+                )
+            if not isinstance(probe_last_n, int) or probe_last_n < 1:
+                raise VLLMValidationError(
+                    "`probe_vocab_logprobs_last_n_tokens` must be a positive integer.",
+                    parameter=PROBE_VOCAB_LOGPROBS_LAST_N_KEY,
+                    value=probe_last_n,
                 )
 
         return data

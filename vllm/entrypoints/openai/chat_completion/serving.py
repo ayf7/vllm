@@ -405,6 +405,7 @@ class OpenAIServingChat(OpenAIServing):
                         max_tokens,
                         self.default_sampling_params,
                     )
+                    self._attach_probe_vocab_logprobs(request, sampling_params)
 
                 self._log_inputs(
                     sub_request_id,
@@ -1748,6 +1749,7 @@ class OpenAIServingChat(OpenAIServing):
             choices=choices,
             usage=usage,
             prompt_logprobs=clamp_prompt_logprobs(final_res.prompt_logprobs),
+            probe_vocab_logprobs=final_res.prompt_probe_logprobs,
             prompt_token_ids=(
                 final_res.prompt_token_ids if request.return_token_ids else None
             ),

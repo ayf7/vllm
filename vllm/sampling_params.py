@@ -23,6 +23,16 @@ logger = init_logger(__name__)
 
 _SAMPLING_EPS = 1e-5
 _MAX_TEMP = 1e-2
+PROBE_VOCAB_LOGPROBS_KEY = "probe_vocab_logprobs"
+PROBE_VOCAB_LOGPROBS_LAST_N_KEY = "probe_vocab_logprobs_last_n_tokens"
+
+
+def has_probe_vocab_logprobs(extra_args: dict[str, Any] | None) -> bool:
+    return bool(
+        extra_args is not None
+        and PROBE_VOCAB_LOGPROBS_KEY in extra_args
+        and extra_args.get(PROBE_VOCAB_LOGPROBS_KEY) is not None
+    )
 
 
 class SamplingType(IntEnum):
@@ -490,6 +500,29 @@ class SamplingParams(
                 parameter="prompt_logprobs",
                 value=self.prompt_logprobs,
             )
+        if has_probe_vocab_logprobs(self.extra_args):
+            assert self.extra_args is not None
+            probe_token_ids = self.extra_args.get(PROBE_VOCAB_LOGPROBS_KEY)
+            if not isinstance(probe_token_ids, list) or not probe_token_ids:
+                raise VLLMValidationError(
+                    "probe_vocab_logprobs must be a non-empty list of token ids.",
+                    parameter=PROBE_VOCAB_LOGPROBS_KEY,
+                    value=probe_token_ids,
+                )
+            if not all(isinstance(token_id, int) for token_id in probe_token_ids):
+                raise VLLMValidationError(
+                    "probe_vocab_logprobs must contain only token ids when "
+                    "used through SamplingParams.extra_args.",
+                    parameter=PROBE_VOCAB_LOGPROBS_KEY,
+                    value=probe_token_ids,
+                )
+            last_n_tokens = self.extra_args.get(PROBE_VOCAB_LOGPROBS_LAST_N_KEY)
+            if not isinstance(last_n_tokens, int) or last_n_tokens < 1:
+                raise VLLMValidationError(
+                    "probe_vocab_logprobs_last_n_tokens must be a positive integer.",
+                    parameter=PROBE_VOCAB_LOGPROBS_LAST_N_KEY,
+                    value=last_n_tokens,
+                )
         assert isinstance(self.stop_token_ids, list)
         if not all(isinstance(st_id, int) for st_id in self.stop_token_ids):
             raise ValueError(
@@ -647,6 +680,23 @@ class SamplingParams(
                     f"which is greater than max allowed: {max_logprobs}",
                     parameter="prompt_logprobs",
                     value=num_prompt_logprobs,
+                )
+
+        if has_probe_vocab_logprobs(self.extra_args):
+            assert self.extra_args is not None
+            vocab_size = model_config.get_vocab_size()
+            invalid_token_ids = [
+                token_id
+                for token_id in self.extra_args[PROBE_VOCAB_LOGPROBS_KEY]
+                if token_id < 0 or token_id >= vocab_size
+            ]
+            if invalid_token_ids:
+                raise VLLMValidationError(
+                    f"token_id(s) {invalid_token_ids} in "
+                    "probe_vocab_logprobs contain out-of-vocab token ids. "
+                    f"Vocabulary size: {vocab_size}",
+                    parameter=PROBE_VOCAB_LOGPROBS_KEY,
+                    value=invalid_token_ids,
                 )
 
     def _validate_logit_bias(self, model_config: ModelConfig) -> None:

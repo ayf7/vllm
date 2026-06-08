@@ -94,6 +94,8 @@ class RequestOutput:
                           For encoder/decoder models, this is the
                           decoder input prompt token ids.
         prompt_logprobs: The log probabilities to return per prompt token.
+        prompt_probe_logprobs: Scalar selected-vocabulary logprobs for probed
+                              prompt positions.
         outputs: The output sequences of the request.
         finished: Whether the whole request is finished.
         metrics: Metrics associated with the request.
@@ -119,6 +121,7 @@ class RequestOutput:
         encoder_prompt: str | None = None,
         encoder_prompt_token_ids: list[int] | None = None,
         num_cached_tokens: int | None = None,
+        prompt_probe_logprobs: list[dict[str, Any]] | None = None,
         *,
         kv_transfer_params: dict[str, Any] | None = None,
         # Forward compatibility, code that uses args added in new release can
@@ -133,6 +136,7 @@ class RequestOutput:
         self.prompt = prompt
         self.prompt_token_ids = prompt_token_ids
         self.prompt_logprobs = prompt_logprobs
+        self.prompt_probe_logprobs = prompt_probe_logprobs
         self.outputs = outputs
         self.finished = finished
         self.metrics = metrics
@@ -147,6 +151,8 @@ class RequestOutput:
 
         self.finished |= next_output.finished
         self.kv_transfer_params = next_output.kv_transfer_params
+        if next_output.prompt_probe_logprobs is not None:
+            self.prompt_probe_logprobs = next_output.prompt_probe_logprobs
 
         for next_completion in next_output.outputs:
             for i, completion in enumerate(self.outputs):

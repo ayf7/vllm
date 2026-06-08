@@ -109,6 +109,10 @@ class OpenAIServingCompletion(OpenAIServing):
             return self.create_error_response(
                 "prompt_logprobs is not compatible with prompt embeds."
             )
+        if request.probe_vocab_logprobs is not None and request.prompt_embeds is not None:
+            return self.create_error_response(
+                "probe_vocab_logprobs is not compatible with prompt embeds."
+            )
 
         try:
             engine_prompts = await self._preprocess_completion(
@@ -161,6 +165,7 @@ class OpenAIServingCompletion(OpenAIServing):
         # Schedule the request and get the result generator.
         max_model_len = self.model_config.max_model_len
         generators: list[AsyncGenerator[RequestOutput, None]] = []
+        tokenizer = self.renderer.tokenizer
         try:
             for i, engine_prompt in enumerate(engine_prompts):
                 max_tokens = get_max_tokens(
@@ -181,6 +186,7 @@ class OpenAIServingCompletion(OpenAIServing):
                         max_tokens,
                         self.default_sampling_params,
                     )
+                    self._attach_probe_vocab_logprobs(request, sampling_params)
 
                 request_id_item = f"{request_id}-{i}"
 
@@ -553,6 +559,7 @@ class OpenAIServingCompletion(OpenAIServing):
                     finish_reason=output.finish_reason,
                     stop_reason=output.stop_reason,
                     prompt_logprobs=final_res.prompt_logprobs,
+                    probe_vocab_logprobs=final_res.prompt_probe_logprobs,
                     prompt_token_ids=(
                         prompt_token_ids if request.return_token_ids else None
                     ),

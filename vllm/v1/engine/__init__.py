@@ -160,6 +160,7 @@ class EngineCoreOutput(
 
     new_logprobs: LogprobsLists | None = None
     new_prompt_logprobs_tensors: LogprobsTensors | None = None
+    new_prompt_probe_logprobs: list[dict[str, Any]] | None = None
 
     pooling_output: torch.Tensor | None = None
 

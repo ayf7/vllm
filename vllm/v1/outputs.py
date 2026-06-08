@@ -4,7 +4,7 @@
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, NamedTuple, TypeAlias, TypeVar
+from typing import TYPE_CHECKING, Any, NamedTuple, TypeAlias, TypeVar
 
 import numpy as np
 import torch
@@ -231,6 +231,11 @@ class ModelRunnerOutput:
     # [prompt_len, num_prompt_logprobs]
     # [prompt_len]
     prompt_logprobs_dict: dict[str, LogprobsTensors | None] = field(
+        default_factory=dict
+    )
+
+    # req_id -> scalar selected-token prompt-boundary logprob records.
+    prompt_probe_logprobs_dict: dict[str, list[dict[str, Any]]] = field(
         default_factory=dict
     )
 

@@ -1576,6 +1576,7 @@ class Scheduler(SchedulerInterface):
         sampled_token_ids = model_runner_output.sampled_token_ids
         logprobs = model_runner_output.logprobs
         prompt_logprobs_dict = model_runner_output.prompt_logprobs_dict
+        prompt_probe_logprobs_dict = model_runner_output.prompt_probe_logprobs_dict
         num_scheduled_tokens = scheduler_output.num_scheduled_tokens
         pooler_outputs = model_runner_output.pooler_output
         num_nans_in_logits = model_runner_output.num_nans_in_logits
@@ -1716,6 +1717,7 @@ class Scheduler(SchedulerInterface):
 
             # Get prompt logprobs for this request.
             prompt_logprobs_tensors = prompt_logprobs_dict.get(req_id)
+            prompt_probe_logprobs = prompt_probe_logprobs_dict.get(req_id)
             if (
                 new_token_ids
                 or pooler_output is not None
@@ -1730,6 +1732,7 @@ class Scheduler(SchedulerInterface):
                         finish_reason=finish_reason,
                         new_logprobs=new_logprobs,
                         new_prompt_logprobs_tensors=prompt_logprobs_tensors,
+                        new_prompt_probe_logprobs=prompt_probe_logprobs,
                         pooling_output=pooler_output,
                         stop_reason=request.stop_reason,
                         events=request.take_events(),
@@ -1744,6 +1747,7 @@ class Scheduler(SchedulerInterface):
             else:
                 # Invariant: EngineCore returns no partial prefill outputs.
                 assert not prompt_logprobs_tensors
+                assert not prompt_probe_logprobs
 
         # Remove the stopped requests from the running and waiting queues.
         if stopped_running_reqs:
