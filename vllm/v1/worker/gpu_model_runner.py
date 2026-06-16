@@ -4802,7 +4802,26 @@ class GPUModelRunner(
                 f"{hidden_states.shape[0]} rows for {len(row_metadata)} metadata rows"
             )
 
-        logits = self.model.compute_logits(hidden_states)
+        # SplitReason prompt-probe: compute the probe logits off the BASE lm_head,
+        # bypassing any LoRA logits adapter. The controller deliberately spares
+        # lm_head from LoRA (the SFT-trained <bigmodel> rows must stay frozen), so
+        # its LoRA contribution to the logits is zero by design. Routing the probe
+        # through LogitsProcessorWithLoRA is also unsafe: the probe feeds an
+        # arbitrary number of rows (the gathered probe positions) into
+        # add_lora_logits, but the punica prompt-mapping metadata is sized for the
+        # sampler batch, so when sampler_count > probe_rows the lora_expand kernel
+        # indexes the row tensors out of bounds -> CUDA illegal memory access. For a
+        # non-LoRA model this path is identical to self.model.compute_logits().
+        logits_processor = getattr(self.model, "logits_processor", None)
+        lm_head = getattr(self.model, "lm_head", None)
+        if logits_processor is not None and lm_head is not None:
+            base_logits_processor = getattr(
+                logits_processor, "base_layer", logits_processor
+            )
+            base_lm_head = getattr(lm_head, "base_layer", lm_head)
+            logits = base_logits_processor(base_lm_head, hidden_states)
+        else:
+            logits = self.model.compute_logits(hidden_states)
         token_ids = torch.tensor(probe_token_ids, device=self.device, dtype=torch.long)
         selected_logits = logits[:, token_ids].to(torch.float32)
         selected_logprobs = selected_logits - torch.logsumexp(
