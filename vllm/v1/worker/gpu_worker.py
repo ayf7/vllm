@@ -155,6 +155,20 @@ class Worker(WorkerBase):
     def sleep(self, level: int = 1) -> None:
         from vllm.device_allocator.cumem import CuMemAllocator
 
+        # SplitReason sleep-race fix: block until all in-flight GPU work on this
+        # device has finished before the allocator frees memory. verl issues
+        # sleep() off a stale "engines idle" signal -- a cross-process, async
+        # wave_complete flag that flickers as the cooperative agent loop cycles
+        # requests through the scheduler (the small engine's scheduler goes
+        # momentarily empty between chunks/handoffs even though generation isn't
+        # done). There is no guarantee the worker's previous execute_model
+        # forward has finished: its kernels are launched async via
+        # execute_model(non_block=True) and may still be on the stream. Freeing
+        # the KV cache out from under a live forward yields "CUDA driver error:
+        # invalid argument". A full-device synchronize makes sleep safe
+        # regardless of how stale/early the idle signal was.
+        torch.cuda.synchronize()
+
         free_bytes_before_sleep = torch.cuda.mem_get_info()[0]
 
         # Save the buffers before level 2 sleep

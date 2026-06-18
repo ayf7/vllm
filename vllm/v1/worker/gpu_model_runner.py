@@ -4757,9 +4757,27 @@ class GPUModelRunner(
                 offset = int(self.query_start_loc.np[req_idx])
                 row_start = overlap_start - current_start
                 row_end = overlap_end - current_start
-                probe_hidden_state_chunks.append(
-                    hidden_states[offset + row_start : offset + row_end]
-                )
+                lo = offset + row_start
+                hi = offset + row_end
+                # SplitReason close-probe bound-guard. This bespoke offset/overlap
+                # arithmetic is the one index path with no native analog (the native
+                # prompt-logprobs loop slices hidden_states[offset:offset+num_logits]
+                # directly). Validate it on the HOST before the slice feeds the
+                # base-lm_head GEMM: a miscomputed window would otherwise read
+                # hidden_states out of bounds and launch a latent async illegal
+                # access that only surfaces at a later, unrelated sync/launch (the
+                # exact failure this probe was crashing with). A hard ValueError here
+                # converts that into a deterministic fault at the offending step.
+                num_rows = hidden_states.shape[0]
+                if not (0 <= lo <= hi <= num_rows):
+                    raise ValueError(
+                        "prompt-probe hidden-state slice out of bounds: "
+                        f"req={req_id} offset={offset} row_start={row_start} "
+                        f"row_end={row_end} -> [{lo}:{hi}] but hidden_states has "
+                        f"{num_rows} rows (overlap=[{overlap_start},{overlap_end}), "
+                        f"current=[{current_start},{current_end}))"
+                    )
+                probe_hidden_state_chunks.append(hidden_states[lo:hi])
                 for position in range(overlap_start, overlap_end):
                     row_metadata.append((req_id, position, probe_token_ids))
                 for token_id in probe_token_ids:
@@ -4769,8 +4787,10 @@ class GPUModelRunner(
                 completed_prefill_reqs.append(req_id)
 
         if probe_hidden_state_chunks:
+            # .contiguous(): the chunks are non-contiguous views into hidden_states;
+            # make the GEMM input contract explicit and dense before projection.
             records_by_req_id = self._compute_prompt_probe_logprob_records(
-                torch.cat(probe_hidden_state_chunks, dim=0),
+                torch.cat(probe_hidden_state_chunks, dim=0).contiguous(),
                 row_metadata=row_metadata,
                 probe_token_ids=list(unique_probe_token_ids.keys()),
             )
@@ -4786,6 +4806,19 @@ class GPUModelRunner(
                 )
             del probe_config_dict[req_id]
             self.in_progress_prompt_probe_logprobs.pop(req_id, None)
+
+        # Restore the native prompt-logprobs contract: this probe launched extra
+        # default-stream GPU work (the cat of view-slices, the base-lm_head GEMM, and
+        # the fp32 logsumexp over all V columns in _compute_prompt_probe_logprob_records)
+        # that the blocking .tolist() copy alone does NOT fully drain. The native path
+        # ends with `if prompt_logprobs_dict: self._sync_device()` for exactly this
+        # reason. Mirror it, gated to probe-prefill steps so pure-decode steps (empty
+        # overlap) pay nothing -- identical guarding discipline to native's
+        # `if prompt_logprobs_dict`. This both restores the "no undrained bookkeeping
+        # GPU work" contract and localizes any residual probe fault AT the probe step,
+        # instead of laundering an async illegal access to a later unrelated sync/launch.
+        if probe_hidden_state_chunks:
+            self._sync_device()
 
         return prompt_probe_logprobs_dict
 
